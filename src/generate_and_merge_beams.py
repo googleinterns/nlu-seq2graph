@@ -74,13 +74,13 @@ def get_top_beam_graphs(model_type,
                            is_train=False,
                            return_all=True)
     predictions = predictions.numpy().tolist()
-    for i in range(len(predictions)):
-      src_token_ids = examples["src_token_ids"][i]
+    for exid in range(len(predictions)):
+      src_token_ids = examples["src_token_ids"][exid]
       src_tokens = [src_vocab.idx2token[idx] for idx in src_token_ids]
       src_length = sum(tok != src_vocab.token2idx[src_vocab.PAD]
                        for tok in src_token_ids.numpy().tolist())
 
-      tgt_tokens = examples["tgt_token_ids"][i].numpy().tolist()
+      tgt_tokens = examples["tgt_token_ids"][exid].numpy().tolist()
       tgt_length = sum(
           tok != tgt_vocab.token2idx[tgt_vocab.PAD] for tok in tgt_tokens)
       tgt_tokens = [
@@ -101,7 +101,7 @@ def get_top_beam_graphs(model_type,
       tgt_nodes = tok_to_tree(tgt_tokens, root)
       graphs.append(tgt_nodes)
 
-      for sent in predictions[i]:
+      for sent in predictions[exid]:
         pred_tokens = sent
         if tgt_vocab.token2idx[tgt_vocab.EOS] in pred_tokens:
           dev_length = pred_tokens.index(tgt_vocab.token2idx[tgt_vocab.EOS])
@@ -114,7 +114,6 @@ def get_top_beam_graphs(model_type,
             if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
             for idx in pred_tokens
         ]
-        aaa = []
         if is_valid_tree(pred_tokens_words, src_tokens, pred_tokens, tgt_vocab):
           for j in range(len(pred_tokens)):
             if pred_tokens[j] >= len(tgt_vocab):
@@ -123,7 +122,6 @@ def get_top_beam_graphs(model_type,
             pred_tokens_words = pred_tokens_words[1:]
           if pred_tokens_words[-1] == tgt_vocab.EOS:
             pred_tokens_words = pred_tokens_words[:-1]
-          aaa.append(pred_tokens_words)
           root = Node(tgt_vocab.BOS, None)
           pred_tokens_nodes = tok_to_tree(pred_tokens_words, root)
 
@@ -132,6 +130,14 @@ def get_top_beam_graphs(model_type,
             if node.is_leaf():
               if not node.word.isnumeric():
                 add = False
+                break
+          if add:
+            # Copied words must be in increasing order
+            src_copied_words = [int(node.word) for node in pred_tokens_nodes if node.is_leaf()]
+            for i in range(1, len(src_copied_words)):
+              if src_copied_words[i] != src_copied_words[i-1] + 1:
+                add = False
+                break
           if add:
             graphs.append(pred_tokens_nodes)
             print("valid", pred_tokens_words)
@@ -188,6 +194,23 @@ def get_top_beam_graphs(model_type,
           print("src_toks", src_tokens)
           print("tgt_tok_length", len(tgt_tok_ids))
 
+        # Sanity check
+        tgt_tokens_copied = [i for i in tgt_tok_ids if i >= len(tgt_vocab)]
+        src_tokens_no_pad = [i for i in src_tokens if i!=src_vocab.PAD]
+        if len(tgt_tokens_copied) != len(src_tokens_no_pad):
+          print("Mismatch tgt copied length")
+          print(tgt_tokens_copied)
+          print(src_tokens_no_pad)
+          sys.exit(-1)
+        passed = True
+        for i in range(1, len(tgt_tokens_copied)):
+          if tgt_tokens_copied[i] != tgt_tokens_copied[i-1] + 1:
+            passed = False
+            break
+        if not passed:
+          print("Incorrect tgt order", tgt_tokens_copied)
+          sys.exit(-1)
+
         features = {}
 
         features["src_token_ids"] = tf.train.Feature(
@@ -197,7 +220,7 @@ def get_top_beam_graphs(model_type,
         features["tgt_edges"] = tf.train.Feature(int64_list=tf.train.Int64List(
             value=tgt_edges.reshape((-1))))
         features["tgt_orig_token_ids"] = tf.train.Feature(
-            int64_list=tf.train.Int64List(value=examples["tgt_token_ids"][i]))
+            int64_list=tf.train.Int64List(value=examples["tgt_token_ids"][exid]))
 
         example = tf.train.Example(features=tf.train.Features(feature=features))
         results.append(example)
@@ -242,7 +265,7 @@ def main(argv):
                            src_vocab=src_vocab,
                            tgt_vocab=tgt_vocab,
                            is_train=False)
-  eval_set = eval_set.batch(FLAGS.batch_size, drop_remainder=False)
+  eval_set = eval_set.batch(FLAGS.batch_size, drop_remainder=True)
   get_top_beam_graphs(model_type,
                       eval_set,
                       src_vocab,

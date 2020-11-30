@@ -33,7 +33,7 @@ class Vocabulary(object):
     self.token2freq = {}
 
   def add(self, token, freq=-1):
-    if token is "":
+    if token == "":
       return
     if token not in self.token2idx:
       self.token2idx[token] = len(self.token2idx)

@@ -39,7 +39,7 @@ class GraphDecoder(tf.keras.layers.Layer):
                tgt_vocab,
                src_seq_len,
                maximum_position_encoding,
-               rate=0.1):
+               rate=0.1, biaffine=True):
     super(GraphDecoder, self).__init__()
 
     self.d_model = d_model
@@ -47,6 +47,7 @@ class GraphDecoder(tf.keras.layers.Layer):
     self.tgt_vocab = tgt_vocab
     self.tgt_vocab_size = len(tgt_vocab)
     self.src_seq_len = src_seq_len
+    self.biaffine = biaffine
 
     self.embedding = tf.keras.layers.Embedding(self.tgt_vocab_size, d_model)
     self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
@@ -64,8 +65,14 @@ class GraphDecoder(tf.keras.layers.Layer):
     self.input_edge_v = tf.keras.layers.Dense(1)
     self.merge_embedding = tf.keras.layers.Dense(self.d_model,
                                                  activation="tanh")
-    self.edge_q = tf.keras.layers.Dense(self.d_model)
-    self.edge_k = tf.keras.layers.Dense(self.d_model)
+    self.edge_q = tf.keras.layers.Dense(self.d_model, activation="tanh")
+    self.edge_k = tf.keras.layers.Dense(self.d_model, activation="tanh")
+    if self.biaffine:
+      w_initializer = tf.keras.initializers.Orthogonal()
+      self.biaffine_w_arc = tf.Variable(
+          initial_value=w_initializer(
+              shape=(1, self.d_model, self.d_model+1), dtype=tf.float32),
+          trainable=True)
 
   def _process_tgt_token_ids(self, tgt_token_ids):
     """Prepare decode_step input.
@@ -222,9 +229,18 @@ class GraphDecoder(tf.keras.layers.Layer):
       k = self.edge_k(mem[self.num_layers])
     else:
       k = self.edge_k(x)
-    edge_scores = tf.matmul(q, k, transpose_b=True)
-    if mem is None:
-      edge_scores += (tf.squeeze(look_ahead_mask, 1) * -1e9)
+    if self.biaffine:
+      ones = tf.ones([batch_size, tf.shape(k)[1], 1], dtype=k.dtype)
+      # (batch_size, t, dim+1)
+      extended_k = tf.concat([k, ones], axis=-1)
+      # (batch_size, 1, dim+1)
+      edge_scores = tf.matmul(q, self.biaffine_w_arc)
+      # (batch_size, 1, t)
+      edge_scores = tf.matmul(edge_scores, extended_k, transpose_b=True)
+    else:
+      edge_scores = tf.matmul(q, k, transpose_b=True)
+      if mem is None:
+        edge_scores += (tf.squeeze(look_ahead_mask, 1) * -1e9)
     return scores, attention_weights, edge_scores
 
 
