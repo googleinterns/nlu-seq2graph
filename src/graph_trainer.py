@@ -44,7 +44,7 @@ flags.DEFINE_string("data_spec", None, "Path to training data spec.")
 flags.DEFINE_integer("batch_size", 32, "Batch size.")
 flags.DEFINE_integer("model_dim", 128, "Model dim.")
 flags.DEFINE_integer("epochs", 10, "Num of epochs.")
-flags.DEFINE_float("dropout", 0.5, "Dropout rate.")
+flags.DEFINE_float("dropout", 0.2, "Dropout rate.")
 flags.DEFINE_string("save_model_path", None, "Save model path.")
 flags.DEFINE_string(
     "predict", None,

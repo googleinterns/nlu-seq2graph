@@ -43,14 +43,13 @@ flags.DEFINE_integer("batch_size", 32, "Batch size.")
 flags.DEFINE_integer("model_dim", 128, "Model dim.")
 flags.DEFINE_integer("epochs", 10, "Num of epochs.")
 flags.DEFINE_integer("beam_size", 1, "beam size.")
-flags.DEFINE_float("dropout", 0.5, "Dropout rate.")
+flags.DEFINE_float("dropout", 0.2, "Dropout rate.")
 flags.DEFINE_string("save_model_path", None, "Save model path.")
 flags.DEFINE_string(
     "predict", None,
     "Init model from save_model_path and run prediction on the data set,")
 flags.DEFINE_string("predict_output", None, "Prediction output.")
 flags.DEFINE_bool("eager_run", False, "Run in eager mode for debugging.")
-flags.DEFINE_bool("predict_edge", False, "use this flag for seq2graph")
 
 FLAGS = flags.FLAGS
 
@@ -63,14 +62,9 @@ class SequenceLoss(object):
     self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
         from_logits=True, reduction="none")
 
-  def __call__(self, pred, ref_token_ids, predict_edge=False):
-    if predict_edge:
-      mask = tf.math.logical_not(tf.math.equal(ref_token_ids, -1))
-      mask_ = tf.cast(tf.math.equal(ref_token_ids, -1), dtype=tf.int64)
-      loss = self.loss_fn(ref_token_ids + mask_, pred)
-    else:
-      mask = tf.math.logical_not(tf.math.equal(ref_token_ids, self.tgt_pad_id))
-      loss = self.loss_fn(ref_token_ids, pred)
+  def __call__(self, pred, ref_token_ids):
+    mask = tf.math.logical_not(tf.math.equal(ref_token_ids, self.tgt_pad_id))
+    loss = self.loss_fn(ref_token_ids, pred)
     mask = tf.cast(mask, dtype=loss.dtype)
     loss *= mask
     return tf.reduce_mean(loss)
@@ -84,8 +78,7 @@ def process_one_batch(model,
                       optimizer,
                       token_accuracy,
                       exact_accuracy,
-                      is_train=True,
-                      edge_accuracy=None):
+                      is_train=True):
   with tf.GradientTape() as tape:
     # Shape: [batch_sz, max_num_tgt_tokens, tgt_vocab_size + max_num_src_tokens]
     tgt_token_ids = examples["tgt_token_ids"]
@@ -116,16 +109,8 @@ def process_one_batch(model,
       loss = 0
 
     else:
-      if FLAGS.predict_edge:
-        tgt_edges = examples["tgt_edges"]
-        prediction_logits, edge_logits = model(examples, is_train=is_train)
-        loss = loss_fn(prediction_logits, tgt_token_ids)
-        loss += loss_fn(edge_logits[:, :-1], tgt_edges[:, 1:],
-                        FLAGS.predict_edge)
-        prediction_edges = tf.argmax(edge_logits, axis=-1)
-      else:
-        prediction_logits = model(examples, is_train=is_train)
-        loss = loss_fn(prediction_logits, tgt_token_ids)
+      prediction_logits = model(examples, is_train=is_train)
+      loss = loss_fn(prediction_logits, tgt_token_ids)
 
       predictions = tf.argmax(prediction_logits, axis=-1)
 
@@ -140,26 +125,10 @@ def process_one_batch(model,
                                 sample_weight=tf.cast(oov_mask,
                                                       dtype=tf.float32))
 
-    if FLAGS.predict_edge:
-      edge_accuracy.update_state(tgt_edges[:, 1:],
-                                 prediction_edges[:, :-1],
-                                 sample_weight=tf.cast(oov_mask[:, 1:],
-                                                       dtype=tf.float32))
-      exact_match = tf.cast(
-          tf.reduce_all(tf.concat([
-              tf.logical_or(tf.equal(tgt_token_ids, predictions),
-                            tf.logical_not(oov_mask)),
-              tf.logical_or(
-                  tf.equal(tgt_edges[:, 1:], prediction_edges[:, :-1]),
-                  tf.logical_not(oov_mask[:, 1:]))
-          ],
-                                  axis=1),
-                        axis=1), tf.float32)
-    else:
-      exact_match = tf.cast(
-          tf.reduce_all(tf.logical_or(tf.equal(tgt_token_ids, predictions),
-                                      tf.logical_not(oov_mask)),
-                        axis=1), tf.float32)
+    exact_match = tf.cast(
+        tf.reduce_all(tf.logical_or(tf.equal(tgt_token_ids, predictions),
+                                    tf.logical_not(oov_mask)),
+                      axis=1), tf.float32)
 
     exact_accuracy.update_state(tf.ones_like(exact_match), exact_match)
 
@@ -189,8 +158,6 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
     total_train_loss = 0
     token_accuracy_train = tf.keras.metrics.Accuracy()
     exact_accuracy_train = tf.keras.metrics.Accuracy()
-    edge_accuracy_train = tf.keras.metrics.Accuracy(
-    ) if FLAGS.predict_edge else None
     for batch, examples in enumerate(train_set):
       batch_loss, _ = process_one_batch(model,
                                         loss_fn,
@@ -198,8 +165,7 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
                                         tgt_vocab,
                                         optimizer,
                                         token_accuracy_train,
-                                        exact_accuracy_train,
-                                        edge_accuracy=edge_accuracy_train)
+                                        exact_accuracy_train)
       total_train_loss += batch_loss
 
       if batch % 100 == 0:
@@ -212,8 +178,6 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
     total_dev_loss = 0
     token_accuracy_dev = tf.keras.metrics.Accuracy()
     exact_accuracy_dev = tf.keras.metrics.Accuracy()
-    edge_accuracy_dev = tf.keras.metrics.Accuracy(
-    ) if FLAGS.predict_edge else None
     for batch, examples in enumerate(dev_set):
       batch_loss, _ = process_one_batch(model,
                                         loss_fn,
@@ -222,8 +186,7 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
                                         optimizer,
                                         token_accuracy_dev,
                                         exact_accuracy_dev,
-                                        is_train=False,
-                                        edge_accuracy=edge_accuracy_dev)
+                                        is_train=False)
 
       total_dev_loss += batch_loss
       # break
@@ -235,9 +198,6 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
     exact_accuracy_train_val = exact_accuracy_train.result().numpy()
     token_accuracy_dev_val = token_accuracy_dev.result().numpy()
     exact_accuracy_dev_val = exact_accuracy_dev.result().numpy()
-    if FLAGS.predict_edge:
-      edge_accuracy_train_val = edge_accuracy_train.result().numpy()
-      edge_accuracy_dev_val = edge_accuracy_dev.result().numpy()
     if best_token_accuracy_train < token_accuracy_train_val:
       best_token_accuracy_train = token_accuracy_train_val
       best_token_accuracy_train_epoch = epoch + 1
@@ -247,33 +207,18 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
       best_token_accuracy_dev_epoch = epoch + 1
       write_model = True
 
-    if FLAGS.predict_edge:
-      message = " ".join([
-          "Epoch {} Train Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} ExactMatch {:.4f}"
-          .format(epoch + 1, total_train_loss / num_train_batch,
-                  token_accuracy_train_val, edge_accuracy_train_val,
-                  exact_accuracy_train_val),
-          "best {:.4f}@{}".format(best_token_accuracy_train,
-                                  best_token_accuracy_train_epoch),
-          "Dev Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} ExactMatch {:.4f}".
-          format(total_dev_loss / num_dev_batch, token_accuracy_dev_val,
-                 edge_accuracy_dev_val, exact_accuracy_dev_val),
-          "best {:.4f}@{}".format(best_token_accuracy_dev,
-                                  best_token_accuracy_dev_epoch)
-      ])
-    else:
-      message = " ".join([
-          "Epoch {} Train Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
-              epoch + 1, total_train_loss / num_train_batch,
-              token_accuracy_train_val, exact_accuracy_train_val),
-          "best {:.4f}@{}".format(best_token_accuracy_train,
-                                  best_token_accuracy_train_epoch),
-          "Dev Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
-              total_dev_loss / num_dev_batch, token_accuracy_dev_val,
-              exact_accuracy_dev_val),
-          "best {:.4f}@{}".format(best_token_accuracy_dev,
-                                  best_token_accuracy_dev_epoch)
-      ])
+    message = " ".join([
+        "Epoch {} Train Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
+            epoch + 1, total_train_loss / num_train_batch,
+            token_accuracy_train_val, exact_accuracy_train_val),
+        "best {:.4f}@{}".format(best_token_accuracy_train,
+                                best_token_accuracy_train_epoch),
+        "Dev Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
+            total_dev_loss / num_dev_batch, token_accuracy_dev_val,
+            exact_accuracy_dev_val),
+        "best {:.4f}@{}".format(best_token_accuracy_dev,
+                                best_token_accuracy_dev_epoch)
+    ])
     print(message)
     if save_model_path:
       with open(os.path.join(save_model_path, "log"), "a") as log_f:
@@ -297,7 +242,6 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
 def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
             predict_output):
   hparams = json.load(open(os.path.join(save_model_path, "hparams.json")))
-  hparams["predict_edge"] = False
   model = model_type(src_vocab, tgt_vocab, hparams)
   model.load_weights(os.path.join(save_model_path, "model_weights"))
   loss_fn = SequenceLoss(tgt_vocab)
@@ -306,7 +250,6 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   total_loss = 0
   token_accuracy = tf.keras.metrics.Accuracy()
   exact_accuracy = tf.keras.metrics.Accuracy()
-  edge_accuracy = tf.keras.metrics.Accuracy() if FLAGS.predict_edge else None
   results = []
   for batch, examples in enumerate(eval_set):
     tgt_token_ids = examples["tgt_token_ids"]
@@ -318,8 +261,7 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
                                                 None,
                                                 token_accuracy,
                                                 exact_accuracy,
-                                                is_train=False,
-                                                edge_accuracy=edge_accuracy)
+                                                is_train=False)
 
     results.append((dict(
         (k, v.numpy()) for k, v in examples.items()), predictions.numpy()))
@@ -328,14 +270,8 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
 
   token_accuracy_val = token_accuracy.result().numpy()
   exact_accuracy_val = exact_accuracy.result().numpy()
-  if FLAGS.predict_edge:
-    edge_accuracy_val = edge_accuracy.result().numpy()
-    print("Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} ExactMatch {:.4f}".format(
-        total_loss / num_batch, token_accuracy_val, edge_accuracy_val,
-        exact_accuracy_val))
-  else:
-    print("Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
-        total_loss / num_batch, token_accuracy_val, exact_accuracy_val))
+  print("Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
+      total_loss / num_batch, token_accuracy_val, exact_accuracy_val))
   print("  Time taken: {}s\n".format(time.time() - dev_start))
 
   if predict_output:
@@ -403,8 +339,7 @@ def main(argv):
                              max_num_tgt_tokens=data_spec["max_num_tgt_tokens"],
                              src_vocab=src_vocab,
                              tgt_vocab=tgt_vocab,
-                             is_train=False,
-                             predict_edge=FLAGS.predict_edge)
+                             is_train=False)
     eval_set = eval_set.batch(FLAGS.batch_size, drop_remainder=False)
     predict(model_type, eval_set, src_vocab, tgt_vocab, FLAGS.save_model_path,
             FLAGS.predict_output)
@@ -415,7 +350,6 @@ def main(argv):
         "num_src_tokens": data_spec["max_num_src_tokens"],
         "num_tgt_tokens": data_spec["max_num_tgt_tokens"],
         "dropout": FLAGS.dropout,
-        "predict_edge": FLAGS.predict_edge
     }
     src_vocab = Vocabulary.load(data_spec["source_vocab"])
     tgt_vocab = Vocabulary.load(data_spec["target_vocab"])
@@ -424,16 +358,14 @@ def main(argv):
                               max_num_tgt_tokens=hparams["num_tgt_tokens"],
                               src_vocab=src_vocab,
                               tgt_vocab=tgt_vocab,
-                              is_train=True,
-                              predict_edge=FLAGS.predict_edge)
+                              is_train=True)
     train_set = train_set.batch(FLAGS.batch_size, drop_remainder=True)
     dev_set = build_dataset(data_spec["dev_set"],
                             max_num_src_tokens=hparams["num_src_tokens"],
                             max_num_tgt_tokens=hparams["num_tgt_tokens"],
                             src_vocab=src_vocab,
                             tgt_vocab=tgt_vocab,
-                            is_train=False,
-                            predict_edge=FLAGS.predict_edge)
+                            is_train=False)
     dev_set = dev_set.batch(FLAGS.batch_size, drop_remainder=True)
 
     train(model_type, FLAGS.epochs, train_set, dev_set, src_vocab, tgt_vocab,

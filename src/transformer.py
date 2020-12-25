@@ -339,8 +339,7 @@ class Decoder(tf.keras.layers.Layer):
                tgt_vocab,
                src_seq_len,
                maximum_position_encoding,
-               rate=0.1,
-               predict_edge=False):
+               rate=0.1):
     super(Decoder, self).__init__()
 
     self.d_model = d_model
@@ -361,12 +360,6 @@ class Decoder(tf.keras.layers.Layer):
                                                         activation="tanh")
 
     self.dropout = tf.keras.layers.Dropout(rate)
-    self.predict_edge = predict_edge
-    if self.predict_edge:
-      self.merge_embedding = tf.keras.layers.Dense(self.d_model,
-                                                   activation="tanh")
-      self.edge_q = tf.keras.layers.Dense(self.d_model)
-      self.edge_k = tf.keras.layers.Dense(self.d_model)
 
   def _process_tgt_token_ids(self, tgt_token_ids):
     """Prepare decode_step input.
@@ -431,33 +424,16 @@ class Decoder(tf.keras.layers.Layer):
            training,
            look_ahead_mask,
            padding_mask,
-           mem=None,
-           tgt_edges=None):
+           mem=None):
 
     batch_size = tf.shape(x)[0]
     seq_len = tf.shape(x)[1]
     attention_weights = {}
-    if tgt_edges is not None:
-      if mem is not None:
-        tgt_edges = tf.expand_dims(tgt_edges[:, -1], -1)
-      mask = tf.cast(tf.math.equal(tgt_edges, -1), tf.int64)
-      mask_reverse = tf.expand_dims(
-          tf.cast(tf.math.not_equal(tgt_edges, -1), tf.float32), 2)
-      tgt_edges += mask
-      edge_x = tf.reshape(
-          tf.gather_nd(tf.expand_dims(x, 2),
-                       indices=tf.expand_dims(tgt_edges, 2),
-                       batch_dims=1), [batch_size, -1])
-      edge_x = self._get_input_embedding(edge_x, enc_output)
-      edge_x *= mask_reverse
     # (batch_size, tgt_seq_len, d_model)
     if mem is not None:
       x = tf.expand_dims(x[:, -1], -1)
 
     x = self._get_input_embedding(x, enc_output)
-
-    if tgt_edges is not None:
-      x = self.merge_embedding(tf.concat([x, edge_x], axis=2))
 
     x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
     if mem is not None:
@@ -500,18 +476,7 @@ class Decoder(tf.keras.layers.Layer):
 
     scores = tf.concat([gen_scores, copy_scores], axis=2)
 
-    if self.predict_edge:
-      q = self.edge_q(x)
-      if mem is not None:
-        k = self.edge_k(mem[self.num_layers])
-      else:
-        k = self.edge_k(x)
-      edge_scores = tf.matmul(q, k, transpose_b=True)
-      if mem is None:
-        edge_scores += (tf.squeeze(look_ahead_mask, 1) * -1e9)
-      return scores, attention_weights, edge_scores
-    else:
-      return scores, attention_weights
+    return scores, attention_weights
 
 
 class Transformer(tf.keras.Model):
@@ -538,7 +503,6 @@ class Transformer(tf.keras.Model):
     self.tgt_vocab_size = len(tgt_vocab)
     self.src_seq_len = self.hparams["num_src_tokens"]
     self.tgt_seq_len = self.hparams["num_tgt_tokens"]
-    self.predict_edge = hparams["predict_edge"]
 
     self.encoder = Encoder(num_layers=self.hparams["num_layers"],
                            d_model=self.hparams["d_model"],
@@ -555,8 +519,7 @@ class Transformer(tf.keras.Model):
                            tgt_vocab=self.tgt_vocab,
                            src_seq_len=self.src_seq_len,
                            maximum_position_encoding=self.tgt_seq_len,
-                           rate=self.hparams["dropout"],
-                           predict_edge=self.predict_edge)
+                           rate=self.hparams["dropout"])
 
   def call(self, examples, beam_size=1, is_train=True, return_all=False):
     if is_train:
@@ -571,8 +534,6 @@ class Transformer(tf.keras.Model):
   def train(self, examples, is_train=True):
     src_token_ids = examples["src_token_ids"]
     tgt_token_ids = examples["tgt_token_ids"]
-    if self.predict_edge:
-      tgt_edges = examples["tgt_edges"]
 
     # enc_padding_mask: (batch_size, 1, 1, src_seq_len)
     # combined_mask: (batch_size, 1, tgt_seq_len, tgt_seq_len)
@@ -586,16 +547,8 @@ class Transformer(tf.keras.Model):
     enc_output = self.encoder(src_token_ids, is_train, enc_padding_mask)
 
     # dec_output.shape == (batch_size, tgt_seq_len, tgt_vocab_size+src_seq_len)
-    if self.predict_edge:
-      dec_output, _, edge_scores = self.decoder(tgt_token_ids,
-                                                enc_output,
-                                                is_train,
-                                                combined_mask,
-                                                dec_padding_mask,
-                                                tgt_edges=tgt_edges)
-    else:
-      dec_output, _ = self.decoder(tgt_token_ids, enc_output, is_train,
-                                   combined_mask, dec_padding_mask)
+    dec_output, _ = self.decoder(tgt_token_ids, enc_output, is_train,
+                                  combined_mask, dec_padding_mask)
     # prepend the BOS token
     # (batch_size, 1)
     start_token = tf.expand_dims(tgt_token_ids[:, 0], axis=-1)
@@ -607,10 +560,7 @@ class Transformer(tf.keras.Model):
     dec_output = tf.concat([start_token_logits, dec_output[:, :-1, :]], axis=1)
 
     # (batch_size, tgt_seq_len, tgt_vocab_size+src_seq_len)
-    if self.predict_edge:
-      return dec_output, edge_scores
-    else:
-      return dec_output
+    return dec_output
 
   def greedy_decode(self,
                     examples,
@@ -635,14 +585,12 @@ class Transformer(tf.keras.Model):
                           repeats=batch_size),
                 dtype=tf.int64), [-1, 1])
     tgt_inputs = start_token
-    tgt_edges = tf.zeros([batch_size, 1], dtype=tf.int64) - 1
 
     start_token_onehot = tf.one_hot(start_token,
                                     depth=(self.tgt_vocab_size +
                                            self.src_seq_len))
     start_token_logits = start_token_onehot + (start_token_onehot - 1) * 1e9
     output = [start_token_logits]
-    edge_output = []
 
     if fast:
       mem = {}
@@ -652,59 +600,29 @@ class Transformer(tf.keras.Model):
     for t in range(1, tgt_seq_len):
       look_ahead_mask = create_look_ahead_mask(t)[tf.newaxis, tf.newaxis, :, :]
       # dec_output.shape == (batch_sz, t, tgt_vocab_size+src_seq_len)
-      if self.predict_edge:
-        dec_output, _, edge_scores = self.decoder(tgt_inputs,
-                                                  enc_output,
-                                                  is_train,
-                                                  look_ahead_mask,
-                                                  dec_padding_mask,
-                                                  mem=mem,
-                                                  tgt_edges=tgt_edges)
-      else:
-        dec_output, _ = self.decoder(tgt_inputs,
-                                     enc_output,
-                                     is_train,
-                                     look_ahead_mask,
-                                     dec_padding_mask,
-                                     mem=mem)
+      dec_output, _ = self.decoder(tgt_inputs,
+                                    enc_output,
+                                    is_train,
+                                    look_ahead_mask,
+                                    dec_padding_mask,
+                                    mem=mem)
       # (batch_sz, tgt_vocab_size+src_seq_len)
       last_step_output = dec_output[:, -1, :]
       last_step_output_idx = tf.expand_dims(tf.argmax(last_step_output, axis=1),
                                             axis=-1)
       tgt_inputs = tf.concat([tgt_inputs, last_step_output_idx], axis=-1)
 
-      if self.predict_edge:
-        last_step_score = edge_scores[:, -1, :]
-        last_step_score_idx = tf.expand_dims(tf.argmax(last_step_score, axis=1),
-                                             axis=-1)
-        tgt_edges = tf.concat([tgt_edges, last_step_score_idx], axis=-1)
-
       # (batch_sz, t+1)
       if fast:
         output.append(dec_output)
-        if self.predict_edge:
-          edge_output.append(
-              tf.concat([
-                  edge_scores,
-                  tf.fill([batch_size, 1, tgt_seq_len - t], -1e9)
-              ],
-                        axis=2))
 
     # here dec_output.shape = (batch_sz, tgt_seq_len-1, tgt_vocab_size+src_seq_len)
     # prepend the BOS token
     # (batch_size, 1, tgt_vocab_size + src_seq_len)
     if not fast:
       output.append(dec_output)
-      if self.predict_edge:
-        edge_output.append(edge_scores)
     dec_output = tf.concat(output, axis=1)
-    if self.predict_edge:
-      edge_output.append(tf.fill([batch_size, 1, tgt_seq_len], -1e9))
-      edge_output = tf.concat(edge_output, axis=1)
-    if self.predict_edge:
-      return dec_output, edge_output
-    else:
-      return dec_output
+    return dec_output
 
   @tf.function
   def beam(self,
