@@ -24,12 +24,14 @@ import tensorflow as tf
 from vocabulary import Vocabulary
 from dataset import build_dataset
 from transformer import Transformer
+from graph_utils import contain_tree
 from graph_utils import merge_tree
 from graph_utils import topological_sort
 from graph_utils import Node
 from graph_utils import is_valid_tree
 from graph_utils import tok_to_tree
 from graph_utils import set_index
+from graph_utils import set_signature
 from graph_utils import tree_to_data
 
 flags.DEFINE_string("data_spec", None, "Path to training data spec.")
@@ -62,6 +64,8 @@ def get_top_beam_graphs(model_type,
   dev_start = time.time()
   total_tree_size = 0
   total_merge_size = 0
+
+  total_cycle_count = 0
 
   results = []
   max_src_length = 0
@@ -153,77 +157,95 @@ def get_top_beam_graphs(model_type,
       tree.reverse()
       print("topo sort" + " ".join([v.word for v in tree]))
 
-      if not has_cycle:
-        eos = Node(tgt_vocab.EOS, tree[0], index=len(tree))
-        tree.append(eos)
-        tree[0].child.append(eos)
+      if has_cycle:
+        print("!!! Cycle detected.")
+        total_cycle_count += 1
+        continue
 
-        set_index(tree)
+      eos = Node(tgt_vocab.EOS, tree[0], index=len(tree))
+      tree.append(eos)
+      tree[0].child.append(eos)
 
-        for g in graphs:
-          batch_tree_size += (len(g) + 1)
-          total_tree_size += (len(g) + 1)
+      set_index(tree)
 
-        batch_merge_size += len(tree)
-        total_merge_size += len(tree)
+      for g in graphs:
+        batch_tree_size += (len(g) + 1)
+        total_tree_size += (len(g) + 1)
 
-        tgt_toks, tgt_edges = tree_to_data(tree, multiple=True)
-        tgt_tok_ids = []
+      batch_merge_size += len(tree)
+      total_merge_size += len(tree)
 
-        for tok in tgt_toks:
-          if tok in tgt_vocab:
-            tgt_tok_ids.append(tgt_vocab.token2idx[tok])
-          elif tok.isnumeric():
-            tgt_tok_ids.append(len(tgt_vocab) + int(tok))
-          else:
-            assert False
-        print(tgt_toks)
-        print(tgt_tok_ids)
-        print(tgt_edges)
-        assert len(tgt_tok_ids) == len(tgt_toks) == len(tgt_edges)
-        if len(tgt_tok_ids) > max_tgt_length:
-          max_tgt_length = len(tgt_tok_ids)
-          print("new_max_tgt_length", max_tgt_length)
-          print("tgt_toks", tgt_toks)
-          print("src_toks", src_tokens)
-          print("src_tok_length", src_length)
-        if src_length > max_src_length:
-          max_src_length = src_length
-          print("new_max_src_length", max_src_length)
-          print("tgt_toks", tgt_toks)
-          print("src_toks", src_tokens)
-          print("tgt_tok_length", len(tgt_tok_ids))
+      tgt_toks, tgt_edges = tree_to_data(tree, multiple=True)
+      tgt_tok_ids = []
 
-        # Sanity check
-        tgt_tokens_copied = [i for i in tgt_tok_ids if i >= len(tgt_vocab)]
-        src_tokens_no_pad = [i for i in src_tokens if i!=src_vocab.PAD]
-        if len(tgt_tokens_copied) != len(src_tokens_no_pad):
-          print("Mismatch tgt copied length")
-          print(tgt_tokens_copied)
-          print(src_tokens_no_pad)
-          sys.exit(-1)
-        passed = True
-        for i in range(1, len(tgt_tokens_copied)):
-          if tgt_tokens_copied[i] != tgt_tokens_copied[i-1] + 1:
-            passed = False
-            break
-        if not passed:
-          print("Incorrect tgt order", tgt_tokens_copied)
-          sys.exit(-1)
+      for tok in tgt_toks:
+        if tok in tgt_vocab:
+          tgt_tok_ids.append(tgt_vocab.token2idx[tok])
+        elif tok.isnumeric():
+          tgt_tok_ids.append(len(tgt_vocab) + int(tok))
+        else:
+          assert False
+      print(tgt_toks)
+      print(tgt_tok_ids)
+      print(tgt_edges)
+      assert len(tgt_tok_ids) == len(tgt_toks) == len(tgt_edges)
+      if len(tgt_tok_ids) > max_tgt_length:
+        max_tgt_length = len(tgt_tok_ids)
+        print("new_max_tgt_length", max_tgt_length)
+        print("tgt_toks", tgt_toks)
+        print("src_toks", src_tokens)
+        print("src_tok_length", src_length)
+      if src_length > max_src_length:
+        max_src_length = src_length
+        print("new_max_src_length", max_src_length)
+        print("tgt_toks", tgt_toks)
+        print("src_toks", src_tokens)
+        print("tgt_tok_length", len(tgt_tok_ids))
 
-        features = {}
+      # Sanity check
+      tgt_tokens_copied = [i for i in tgt_tok_ids if i >= len(tgt_vocab)]
+      src_tokens_no_pad = [i for i in src_tokens if i!=src_vocab.PAD]
+      if len(tgt_tokens_copied) != len(src_tokens_no_pad):
+        print("Mismatch tgt copied length")
+        print(tgt_tokens_copied)
+        print(src_tokens_no_pad)
+        sys.exit(-1)
+      passed = True
+      for i in range(1, len(tgt_tokens_copied)):
+        if tgt_tokens_copied[i] != tgt_tokens_copied[i-1] + 1:
+          passed = False
+          break
+      if not passed:
+        print("Incorrect tgt order", tgt_tokens_copied)
+        sys.exit(-1)
+      # reconstruct the ref tree
+      ref_root = Node(tgt_vocab.BOS, None)
+      ref_nodes = tok_to_tree(tgt_tokens, ref_root)
+      set_signature(ref_nodes[0])
+      passed = contain_tree(tree[0], ref_nodes[0])
+      if not passed:
+        print("Reference tree not included in graph")
+        print("Refrence tree", ref_nodes)
+        print("Graph", tree)
+        sys.exit(-1)
 
-        features["src_token_ids"] = tf.train.Feature(
-            int64_list=tf.train.Int64List(value=src_token_ids[:src_length]))
-        features["tgt_token_ids"] = tf.train.Feature(
-            int64_list=tf.train.Int64List(value=tgt_tok_ids))
-        features["tgt_edges"] = tf.train.Feature(int64_list=tf.train.Int64List(
-            value=tgt_edges.reshape((-1))))
-        features["tgt_orig_token_ids"] = tf.train.Feature(
-            int64_list=tf.train.Int64List(value=examples["tgt_token_ids"][exid]))
+      features = {}
 
-        example = tf.train.Example(features=tf.train.Features(feature=features))
-        results.append(example)
+      features["src_tokens"] = tf.train.Feature(bytes_list=tf.train.BytesList(
+          value=(tok.encode("utf-8") for tok in src_tokens[:src_length])))
+      features["src_token_ids"] = tf.train.Feature(
+          int64_list=tf.train.Int64List(value=src_token_ids[:src_length]))
+      features["tgt_tokens"] = tf.train.Feature(bytes_list=tf.train.BytesList(
+          value=(tok.encode("utf-8") for tok in tgt_toks)))
+      features["tgt_token_ids"] = tf.train.Feature(
+          int64_list=tf.train.Int64List(value=tgt_tok_ids))
+      features["tgt_edges"] = tf.train.Feature(int64_list=tf.train.Int64List(
+          value=tgt_edges.reshape((-1))))
+      features["tgt_orig_token_ids"] = tf.train.Feature(
+          int64_list=tf.train.Int64List(value=examples["tgt_token_ids"][exid]))
+
+      example = tf.train.Example(features=tf.train.Features(feature=features))
+      results.append(example)
 
     print("batch total size: {}, merge size: {}".format(batch_tree_size,
                                                         batch_merge_size))
@@ -232,6 +254,7 @@ def get_top_beam_graphs(model_type,
       print("Batch {}, Time {}s".format(batch, time.time() - dev_start))
   print("total size: {}, merge size: {}".format(total_tree_size,
                                                 total_merge_size))
+  print("total # of examples with cycles", total_cycle_count)
   with tf.io.TFRecordWriter(output_record) as record_writer:
     count = 0
     max_src_len = 0

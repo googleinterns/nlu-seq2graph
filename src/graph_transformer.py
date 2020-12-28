@@ -39,7 +39,8 @@ class GraphDecoder(tf.keras.layers.Layer):
                tgt_vocab,
                src_seq_len,
                maximum_position_encoding,
-               rate=0.1, biaffine=True):
+               rate=0.1,
+               biaffine=True):
     super(GraphDecoder, self).__init__()
 
     self.d_model = d_model
@@ -69,10 +70,9 @@ class GraphDecoder(tf.keras.layers.Layer):
     self.edge_k = tf.keras.layers.Dense(self.d_model, activation="tanh")
     if self.biaffine:
       w_initializer = tf.keras.initializers.Orthogonal()
-      self.biaffine_w_arc = tf.Variable(
-          initial_value=w_initializer(
-              shape=(1, self.d_model, self.d_model+1), dtype=tf.float32),
-          trainable=True)
+      self.biaffine_w_arc = tf.Variable(initial_value=w_initializer(
+          shape=(1, self.d_model, self.d_model + 1), dtype=tf.float32),
+                                        trainable=True)
 
   def _process_tgt_token_ids(self, tgt_token_ids):
     """Prepare decode_step input.
@@ -140,15 +140,17 @@ class GraphDecoder(tf.keras.layers.Layer):
            padding_mask,
            mem=None,
            tgt_edges=None):
+    # x.shape: [batch_size, seq_len]
+    # tgt_edges.shape: [batch_size, seq_len, tgt_seq_len]
 
     batch_size = tf.shape(x)[0]
     seq_len = tf.shape(x)[1]
     attention_weights = {}
 
-    # (batch_size, tgt_seq_len, d_model)
     if mem is not None:
       x = tf.expand_dims(x[:, -1], -1)
 
+    # (batch_size, tgt_seq_len, d_model)
     x = self._get_input_embedding(x, enc_output)
     x_ = None
     if mem is not None:
@@ -157,7 +159,7 @@ class GraphDecoder(tf.keras.layers.Layer):
         x_ = mem[-1][:, :-1]
       else:
         mem[-1] = x
-        x_ = mem[-1]
+        x_ = mem[-1]  # ?
 
     if tgt_edges is not None:
       tgt_edges = tf.cast(tgt_edges, dtype=tf.float32)
@@ -165,9 +167,12 @@ class GraphDecoder(tf.keras.layers.Layer):
         if seq_len == 1:
           edge_x = tf.zeros([batch_size, 1, self.d_model])
         else:
-          tgt_edges = tf.expand_dims(tgt_edges[:, -1, :], 1)
+          # [batch, 1, tgt_seq_len]
+          tgt_edges = tf.expand_dims(tgt_edges[:, -1,  :], 1)
+          # [batch, 1, seq_len-1]
           att_logit = tf.squeeze(
               self.input_edge_v(self.input_edge_w(tf.expand_dims(x_, 1))), -1)
+          # mask out non-exist edges
           att_logit += (1 - tgt_edges[:, :, :(seq_len - 1)]) * -1e9
           att_score = tf.nn.softmax(att_logit,
                                     axis=-1) * tgt_edges[:, :, :(seq_len - 1)]
@@ -239,8 +244,8 @@ class GraphDecoder(tf.keras.layers.Layer):
       edge_scores = tf.matmul(edge_scores, extended_k, transpose_b=True)
     else:
       edge_scores = tf.matmul(q, k, transpose_b=True)
-      if mem is None:
-        edge_scores += (tf.squeeze(look_ahead_mask, 1) * -1e9)
+    if mem is None:
+      edge_scores += (tf.squeeze(look_ahead_mask, 1) * -1e9)
     return scores, attention_weights, edge_scores
 
 
@@ -286,7 +291,7 @@ class GraphTransformer(tf.keras.Model):
                                 maximum_position_encoding=self.tgt_seq_len,
                                 rate=self.hparams["dropout"])
 
-  def call(self, examples, beam_size=1, is_train=True, return_all=False):
+  def call(self, examples, is_train=True):
     if is_train:
       return self.train(examples, is_train)
     else:
@@ -328,11 +333,7 @@ class GraphTransformer(tf.keras.Model):
     # (batch_size, tgt_seq_len, tgt_vocab_size+src_seq_len)
     return dec_output, edge_scores
 
-  def greedy_decode(self,
-                    examples,
-                    is_train=False,
-                    tgt_seq_len=None,
-                    fast=True):
+  def greedy_decode(self, examples, is_train=False, tgt_seq_len=None):
     # at each step, decode with whole output prefix
     src_token_ids = examples["src_token_ids"]
 

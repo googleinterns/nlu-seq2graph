@@ -42,6 +42,9 @@ class Node(object):
   def is_root(self):
     return len(self.parent) == 0
 
+  def __repr__(self):
+    return self.word
+
 
 def preorder_traversal(root):
   nodes = [root]

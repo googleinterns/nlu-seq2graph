@@ -19,7 +19,7 @@ trainer --data_folder ~/workspace/seq2graph/spider \
 
 Predicting:
 trainer --save_model_path ~/workspace/seq2graph/seq2seq_savedmodel \
-  --predict ~/workspace/seq2graph/spider/train.sstable \
+  --predict ~/workspace/seq2graph/spider/train.record \
   --predict_output ~/tmp/seq2seq_train.txt
 """
 
@@ -82,6 +82,8 @@ def process_one_batch(model,
   with tf.GradientTape() as tape:
     # Shape: [batch_sz, max_num_tgt_tokens, tgt_vocab_size + max_num_src_tokens]
     tgt_token_ids = examples["tgt_token_ids"]
+    predictions = None
+    beam_predictions = None
     if FLAGS.beam_size > 1 and is_train is False:
       beam_predictions, scores = model(examples,
                                        beam_size=FLAGS.beam_size,
@@ -132,7 +134,7 @@ def process_one_batch(model,
 
     exact_accuracy.update_state(tf.ones_like(exact_match), exact_match)
 
-  return loss, predictions
+  return loss, predictions, beam_predictions
 
 
 def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
@@ -159,13 +161,9 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
     token_accuracy_train = tf.keras.metrics.Accuracy()
     exact_accuracy_train = tf.keras.metrics.Accuracy()
     for batch, examples in enumerate(train_set):
-      batch_loss, _ = process_one_batch(model,
-                                        loss_fn,
-                                        examples,
-                                        tgt_vocab,
-                                        optimizer,
-                                        token_accuracy_train,
-                                        exact_accuracy_train)
+      batch_loss, _, _ = process_one_batch(model, loss_fn, examples, tgt_vocab,
+                                           optimizer, token_accuracy_train,
+                                           exact_accuracy_train)
       total_train_loss += batch_loss
 
       if batch % 100 == 0:
@@ -179,14 +177,14 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
     token_accuracy_dev = tf.keras.metrics.Accuracy()
     exact_accuracy_dev = tf.keras.metrics.Accuracy()
     for batch, examples in enumerate(dev_set):
-      batch_loss, _ = process_one_batch(model,
-                                        loss_fn,
-                                        examples,
-                                        tgt_vocab,
-                                        optimizer,
-                                        token_accuracy_dev,
-                                        exact_accuracy_dev,
-                                        is_train=False)
+      batch_loss, _, _ = process_one_batch(model,
+                                           loss_fn,
+                                           examples,
+                                           tgt_vocab,
+                                           optimizer,
+                                           token_accuracy_dev,
+                                           exact_accuracy_dev,
+                                           is_train=False)
 
       total_dev_loss += batch_loss
       # break
@@ -239,6 +237,42 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
         dev_start - train_start, epoch_finish - dev_start))
 
 
+def write_predictions(result_dicts, predict_output, src_vocab, tgt_vocab):
+  # Rebuild the tokens
+  with open(os.path.join(predict_output), "w") as output_f:
+    for example in result_dicts:
+      src_token_ids = example["src_token_ids"]
+      src_tokens = [src_vocab.idx2token[idx] for idx in src_token_ids]
+      tgt_token_ids = example["tgt_token_ids"]
+      tgt_tokens = [
+          tgt_vocab.idx2token[idx]
+          if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
+          for idx in tgt_token_ids
+      ]
+      predicted_tgt_token_ids = example["predicted_tgt_token_ids"]
+      predicted_tgt_tokens = [
+          tgt_vocab.idx2token[idx]
+          if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
+          for idx in predicted_tgt_token_ids
+      ]
+
+      print("src_token_ids:\t",
+            ", ".join(str(v) for v in src_token_ids),
+            file=output_f)
+      print("src_tokens:\t", " ".join(src_tokens), file=output_f)
+      print("tgt_token_ids:\t",
+            ", ".join(str(v) for v in tgt_token_ids),
+            file=output_f)
+      print("tgt_tokens:\t", " ".join(tgt_tokens), file=output_f)
+      print("predicted_tgt_token_ids:\t",
+            ", ".join(str(v) for v in predicted_tgt_token_ids),
+            file=output_f)
+      print("predicted_tgt_tokens:\t",
+            " ".join(predicted_tgt_tokens),
+            file=output_f)
+      print("\n", file=output_f)
+
+
 def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
             predict_output):
   hparams = json.load(open(os.path.join(save_model_path, "hparams.json")))
@@ -254,17 +288,19 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   for batch, examples in enumerate(eval_set):
     tgt_token_ids = examples["tgt_token_ids"]
 
-    batch_loss, predictions = process_one_batch(model,
-                                                loss_fn,
-                                                examples,
-                                                tgt_vocab,
-                                                None,
-                                                token_accuracy,
-                                                exact_accuracy,
-                                                is_train=False)
+    batch_loss, predictions, beam_predictions = process_one_batch(
+        model,
+        loss_fn,
+        examples,
+        tgt_vocab,
+        None,
+        token_accuracy,
+        exact_accuracy,
+        is_train=False)
 
-    results.append((dict(
-        (k, v.numpy()) for k, v in examples.items()), predictions.numpy()))
+    results.append(
+        (dict((k, v.numpy()) for k, v in examples.items()), predictions.numpy(),
+         (beam_predictions.numpy() if beam_predictions is not None else None)))
     total_loss += batch_loss
   num_batch = batch + 1
 
@@ -274,51 +310,43 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
       total_loss / num_batch, token_accuracy_val, exact_accuracy_val))
   print("  Time taken: {}s\n".format(time.time() - dev_start))
 
-  if predict_output:
-    result_dicts = []
-    for examples, predictions in results:
-      batch_sz = examples["src_token_ids"].shape[0]
-      batch_dicts = [dict() for _ in range(batch_sz)]
-      for key, tensor in examples.items():
-        for i in range(batch_sz):
-          batch_dicts[i][key] = tensor[i].tolist()
+  # Flatten the results over batches
+  result_dicts = []
+  for examples, predictions, beam_predictions in results:
+    batch_sz = examples["src_token_ids"].shape[0]
+    batch_dicts = [dict() for _ in range(batch_sz)]
+    for key, tensor in examples.items():
       for i in range(batch_sz):
-        batch_dicts[i]["predicted_tgt_token_ids"] = predictions[i].tolist()
-      result_dicts.extend(batch_dicts)
+        batch_dicts[i][key] = tensor[i].tolist()
+    for i in range(batch_sz):
+      batch_dicts[i]["predicted_tgt_token_ids"] = predictions[i].tolist()
+      if type(beam_predictions) != type(None):
+        batch_dicts[i]["predicted_tgt_beam"] = beam_predictions[i]
+    result_dicts.extend(batch_dicts)
 
-    # Rebuild the tokens
-    with open(os.path.join(predict_output), "w") as output_f:
-      for example in result_dicts:
-        src_token_ids = example["src_token_ids"]
-        src_tokens = [src_vocab.idx2token[idx] for idx in src_token_ids]
-        tgt_token_ids = example["tgt_token_ids"]
-        tgt_tokens = [
-            tgt_vocab.idx2token[idx]
-            if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
-            for idx in tgt_token_ids
-        ]
-        predicted_tgt_token_ids = example["predicted_tgt_token_ids"]
-        predicted_tgt_tokens = [
-            tgt_vocab.idx2token[idx]
-            if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
-            for idx in predicted_tgt_token_ids
-        ]
+  # Calculate offline metrics
+  exact_match_count = 0
+  exact_match_at_k_count = 0
+  for example in result_dicts:
+    tgt_token_ids = example["tgt_token_ids"]
+    predicted_tgt_token_ids = example["predicted_tgt_token_ids"]
+    if "predicted_tgt_beam" in example:
+      predicted_tgt_beam = example["predicted_tgt_beam"]
+      if tgt_token_ids == predicted_tgt_token_ids:
+        exact_match_count += 1
+      if any([
+          pred.tolist()[:len(tgt_token_ids)] == tgt_token_ids
+          for pred in predicted_tgt_beam
+      ]):
+        exact_match_at_k_count += 1
+  print("Offline exact match {:.4f}".format(
+      float(exact_match_count) / len(result_dicts)))
+  print("Offline exact match @ K={} {:.4f}".format(
+      FLAGS.beam_size,
+      float(exact_match_at_k_count) / len(result_dicts)))
 
-        print("src_token_ids:\t",
-              ", ".join(str(v) for v in src_token_ids),
-              file=output_f)
-        print("src_tokens:\t", " ".join(src_tokens), file=output_f)
-        print("tgt_token_ids:\t",
-              ", ".join(str(v) for v in tgt_token_ids),
-              file=output_f)
-        print("tgt_tokens:\t", " ".join(tgt_tokens), file=output_f)
-        print("predicted_tgt_token_ids:\t",
-              ", ".join(str(v) for v in predicted_tgt_token_ids),
-              file=output_f)
-        print("predicted_tgt_tokens:\t",
-              " ".join(predicted_tgt_tokens),
-              file=output_f)
-        print("\n", file=output_f)
+  if predict_output:
+    write_predictions(result_dicts, predict_output, src_vocab, tgt_vocab)
 
 
 def main(argv):

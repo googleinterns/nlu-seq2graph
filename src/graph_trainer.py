@@ -19,7 +19,7 @@ trainer --data_folder ~/workspace/seq2graph/spider \
 
 Predicting:
 trainer --save_model_path ~/workspace/seq2graph/seq2seq_savedmodel \
-  --predict ~/workspace/seq2graph/spider/train.sstable \
+  --predict ~/workspace/seq2graph/spider/train.record \
   --predict_output ~/tmp/seq2seq_train.txt
 """
 
@@ -33,6 +33,7 @@ import shutil
 import time
 
 import tensorflow as tf
+import numpy as np
 
 from vocabulary import Vocabulary
 from dataset import build_dataset
@@ -238,34 +239,22 @@ def train(model_type,
       all_tree = 0
       cycle_num = 0
     for batch, examples in enumerate(dev_set):
+      (batch_loss, dev_predictions, dev_prediction_edge, p, r,
+       f1) = process_one_batch(model,
+                               loss_fn,
+                               examples,
+                               tgt_vocab,
+                               optimizer,
+                               token_accuracy_dev,
+                               exact_accuracy_dev,
+                               is_train=False,
+                               edge_accuracy=edge_accuracy_dev)
+      total_dev_loss += batch_loss
       if not FLAGS.test_seq2graph:
-        (batch_loss, dev_predictions, dev_prediction_edge, p, r,
-         f1) = process_one_batch(model,
-                                 loss_fn,
-                                 examples,
-                                 tgt_vocab,
-                                 optimizer,
-                                 token_accuracy_dev,
-                                 exact_accuracy_dev,
-                                 is_train=False,
-                                 edge_accuracy=edge_accuracy_dev)
         dev_p += p
         dev_r += r
         dev_f1 += f1
-        total_dev_loss += batch_loss
       else:
-        (batch_loss, dev_predictions, dev_prediction_edge, _, _,
-         _) = process_one_batch(model,
-                                loss_fn,
-                                examples,
-                                tgt_vocab,
-                                optimizer,
-                                token_accuracy_dev,
-                                exact_accuracy_dev,
-                                is_train=False,
-                                edge_accuracy=edge_accuracy_dev)
-        total_dev_loss += batch_loss
-
         for e in range(len(examples["tgt_token_ids"])):
 
           orig_tgt_token_ids = examples["tgt_token_ids"][e].numpy().tolist()
@@ -437,7 +426,7 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   edge_accuracy = tf.keras.metrics.Accuracy()
   results = []
   for batch, examples in enumerate(eval_set):
-    (batch_loss, predictions, _, _, _,
+    (batch_loss, predictions, predictions_edge, _, _,
      _) = process_one_batch(model,
                             loss_fn,
                             examples,
@@ -447,8 +436,8 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
                             exact_accuracy,
                             is_train=False,
                             edge_accuracy=edge_accuracy)
-    results.append((dict(
-        (k, v.numpy()) for k, v in examples.items()), predictions.numpy()))
+    results.append((dict((k, v.numpy()) for k, v in examples.items()),
+                    predictions.numpy(), predictions_edge.numpy()))
     total_loss += batch_loss
   num_batch = batch + 1
 
@@ -463,7 +452,7 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
 
   if predict_output:
     result_dicts = []
-    for examples, predictions in results:
+    for examples, predictions, predictions_edge in results:
       batch_sz = examples["src_token_ids"].shape[0]
       batch_dicts = [dict() for _ in range(batch_sz)]
       for key, tensor in examples.items():
@@ -471,6 +460,13 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
           batch_dicts[i][key] = tensor[i].tolist()
       for i in range(batch_sz):
         batch_dicts[i]["predicted_tgt_token_ids"] = predictions[i].tolist()
+        if tgt_vocab.token2idx[
+            tgt_vocab.EOS] in batch_dicts[i]["predicted_tgt_token_ids"]:
+          predicted_tgt_length = batch_dicts[i]["predicted_tgt_token_ids"].index(
+              tgt_vocab.token2idx[tgt_vocab.EOS]) + 1
+        else:
+          predicted_tgt_length = len(batch_dicts[i]["predicted_tgt_token_ids"])
+        batch_dicts[i]["predicted_tgt_edges"] = predictions_edge[i]
       result_dicts.extend(batch_dicts)
 
     # Rebuild the tokens
@@ -490,6 +486,27 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
             if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
             for idx in predicted_tgt_token_ids
         ]
+        tgt_length = tgt_token_ids.index(tgt_vocab.token2idx[tgt_vocab.EOS]) + 1
+        tgt_edges = np.array(
+            example["tgt_edges"])[:tgt_length, :tgt_length].reshape(
+                (tgt_length, tgt_length))
+        if tgt_vocab.token2idx[tgt_vocab.EOS] in predicted_tgt_token_ids:
+          predicted_tgt_length = predicted_tgt_token_ids.index(
+              tgt_vocab.token2idx[tgt_vocab.EOS])
+        else:
+          predicted_tgt_length = len(predicted_tgt_token_ids) - 1
+        predicted_tgt_edges = (example["predicted_tgt_edges"]
+                               [:predicted_tgt_length, :predicted_tgt_length])
+
+        tgt_tree, _ = reconstruct_tree(tgt_token_ids, tgt_edges, tgt_length - 1,
+                                       tgt_vocab)
+        predict_tree, _ = reconstruct_tree(predicted_tgt_token_ids[1:],
+                                           predicted_tgt_edges[:-1],
+                                           predicted_tgt_length - 1,
+                                           tgt_vocab,
+                                           with_bos=True)
+
+        tree_in = contain_tree(predict_tree[0], tgt_tree[0])
 
         print("src_token_ids:\t",
               ", ".join(str(v) for v in src_token_ids),
@@ -505,6 +522,11 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
         print("predicted_tgt_tokens:\t",
               " ".join(predicted_tgt_tokens),
               file=output_f)
+        print("tgt edges", file=output_f)
+        print(tgt_edges, file=output_f)
+        print("predicted tgt edges", file=output_f)
+        print(predicted_tgt_edges, file=output_f)
+        print("!!! tree in", tree_in, file=output_f)
         print("\n", file=output_f)
 
 
@@ -527,7 +549,8 @@ def main(argv):
                              src_vocab=src_vocab,
                              tgt_vocab=tgt_vocab,
                              is_train=False,
-                             predict_edge=True)
+                             predict_edge=True,
+                             multiple=True)
     eval_set = eval_set.batch(FLAGS.batch_size, drop_remainder=False)
     predict(model_type, eval_set, src_vocab, tgt_vocab, FLAGS.save_model_path,
             FLAGS.predict_output)
