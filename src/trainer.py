@@ -36,6 +36,8 @@ import tensorflow as tf
 
 from vocabulary import Vocabulary
 from dataset import build_dataset
+from training_utils import NoamSchedule
+from training_utils import SequenceLoss
 from transformer import Transformer
 
 flags.DEFINE_string("data_spec", None, "Path to training data spec.")
@@ -52,22 +54,6 @@ flags.DEFINE_string("predict_output", None, "Prediction output.")
 flags.DEFINE_bool("eager_run", False, "Run in eager mode for debugging.")
 
 FLAGS = flags.FLAGS
-
-
-class SequenceLoss(object):
-
-  def __init__(self, tgt_vocab):
-    self.tgt_pad_id = tgt_vocab.token2idx[tgt_vocab.PAD]
-    self.tgt_vocab_size = len(tgt_vocab)
-    self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, reduction="none")
-
-  def __call__(self, pred, ref_token_ids):
-    mask = tf.math.logical_not(tf.math.equal(ref_token_ids, self.tgt_pad_id))
-    loss = self.loss_fn(ref_token_ids, pred)
-    mask = tf.cast(mask, dtype=loss.dtype)
-    loss *= mask
-    return tf.reduce_mean(loss)
 
 
 @tf.function
@@ -139,7 +125,8 @@ def process_one_batch(model,
 
 def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
           save_model_path):
-  optimizer = tf.keras.optimizers.Adam()
+  optimizer = tf.keras.optimizers.Adam(
+      learning_rate=NoamSchedule(FLAGS.model_dim))
   model = model_type(src_vocab, tgt_vocab, hparams)
   loss_fn = SequenceLoss(tgt_vocab)
 

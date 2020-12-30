@@ -33,6 +33,7 @@ import shutil
 import time
 
 import tensorflow as tf
+import tensorflow_addons as tfa
 import numpy as np
 
 from vocabulary import Vocabulary
@@ -40,12 +41,16 @@ from dataset import build_dataset
 from graph_transformer import GraphTransformer
 from graph_utils import contain_tree
 from graph_utils import reconstruct_tree
+from training_utils import NoamSchedule
+from training_utils import EdgeLoss
+from training_utils import SequenceLoss
 
 flags.DEFINE_string("data_spec", None, "Path to training data spec.")
 flags.DEFINE_integer("batch_size", 32, "Batch size.")
 flags.DEFINE_integer("model_dim", 128, "Model dim.")
 flags.DEFINE_integer("epochs", 10, "Num of epochs.")
 flags.DEFINE_float("dropout", 0.2, "Dropout rate.")
+flags.DEFINE_bool("biaffine", True, "Use Biaffine in edge prediction.")
 flags.DEFINE_string("save_model_path", None, "Save model path.")
 flags.DEFINE_string(
     "predict", None,
@@ -58,35 +63,10 @@ flags.DEFINE_bool("test_seq2graph", False,
 FLAGS = flags.FLAGS
 
 
-class SequenceEdgeLoss(object):
-
-  def __init__(self, tgt_vocab):
-    self.tgt_pad_id = tgt_vocab.token2idx[tgt_vocab.PAD]
-    self.tgt_vocab_size = len(tgt_vocab)
-    self.loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, reduction="none")
-
-  def __call__(self, pred, ref_token_ids, predict_edge=False, m=None):
-    if predict_edge:
-      loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.cast(
-          ref_token_ids, pred.dtype),
-                                                     logits=pred)
-      mask = tf.cast(m, dtype=loss.dtype)
-      loss *= mask[:, 1:, tf.newaxis]
-      loss *= mask[:, tf.newaxis, :]
-      loss = tf.boolean_mask(loss, tf.math.not_equal(loss, 0))
-    else:
-      mask = tf.math.logical_not(tf.math.equal(ref_token_ids, self.tgt_pad_id))
-      loss = self.loss_fn(ref_token_ids, pred)
-      mask = tf.cast(mask, dtype=loss.dtype)
-      loss *= mask
-      loss = tf.boolean_mask(loss, tf.math.not_equal(loss, 0))
-    return tf.reduce_mean(loss)
-
-
 @tf.function
 def process_one_batch(model,
-                      loss_fn,
+                      sequence_loss_fn,
+                      edge_loss_fn,
                       examples,
                       tgt_vocab,
                       optimizer,
@@ -99,12 +79,11 @@ def process_one_batch(model,
     tgt_token_ids = examples["tgt_token_ids"]
     tgt_edges = examples["tgt_edges"]
     prediction_logits, edge_logits = model(examples, is_train=is_train)
-    loss = loss_fn(prediction_logits, tgt_token_ids)
+    loss = sequence_loss_fn(prediction_logits, tgt_token_ids)
     m = tf.math.not_equal(tgt_token_ids, tgt_vocab.token2idx[tgt_vocab.PAD])
-    loss += loss_fn(edge_logits[:, :-1, :],
-                    tgt_edges[:, 1:, :],
-                    predict_edge=True,
-                    m=m)
+    loss += edge_loss_fn(edge_logits[:, :-1, :],
+                              tgt_edges[:, 1:, :],
+                              edge_mask=m)
     prediction_edge = tf.cast(edge_logits > 0, dtype=tf.int64)
 
     predictions = tf.argmax(prediction_logits, axis=-1)
@@ -170,9 +149,11 @@ def train(model_type,
           hparams,
           save_model_path,
           log_error=False):
-  optimizer = tf.keras.optimizers.Adam()
+  optimizer = tf.keras.optimizers.Adam(
+      learning_rate=NoamSchedule(FLAGS.model_dim))
   model = model_type(src_vocab, tgt_vocab, hparams)
-  loss_fn = SequenceEdgeLoss(tgt_vocab)
+  sequence_loss_fn = SequenceLoss(tgt_vocab)
+  edge_loss_fn = EdgeLoss()
 
   error_log = []
 
@@ -205,7 +186,8 @@ def train(model_type,
     for batch, examples in enumerate(train_set):
       batch_loss, _, _, p, r, f1 = process_one_batch(
           model,
-          loss_fn,
+          sequence_loss_fn,
+          edge_loss_fn,
           examples,
           tgt_vocab,
           optimizer,
@@ -241,7 +223,8 @@ def train(model_type,
     for batch, examples in enumerate(dev_set):
       (batch_loss, dev_predictions, dev_prediction_edge, p, r,
        f1) = process_one_batch(model,
-                               loss_fn,
+                               sequence_loss_fn,
+                               edge_loss_fn,
                                examples,
                                tgt_vocab,
                                optimizer,
@@ -417,7 +400,8 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   hparams["predict_edge"] = False
   model = model_type(src_vocab, tgt_vocab, hparams)
   model.load_weights(os.path.join(save_model_path, "model_weights"))
-  loss_fn = SequenceEdgeLoss(tgt_vocab)
+  sequence_loss_fn = SequenceLoss(tgt_vocab)
+  edge_loss_fn = EdgeLoss()
 
   dev_start = time.time()
   total_loss = 0
@@ -428,7 +412,7 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   for batch, examples in enumerate(eval_set):
     (batch_loss, predictions, predictions_edge, _, _,
      _) = process_one_batch(model,
-                            loss_fn,
+                            sequence_loss_fn, edge_loss_fn,
                             examples,
                             tgt_vocab,
                             None,
@@ -558,6 +542,7 @@ def main(argv):
     hparams = {
         "batch_sz": FLAGS.batch_size,
         "d_model": FLAGS.model_dim,
+        "biaffine": FLAGS.biaffine,
         "num_src_tokens": data_spec["max_num_src_tokens"],
         "num_tgt_tokens": data_spec["max_num_tgt_tokens"],
         "dropout": FLAGS.dropout,

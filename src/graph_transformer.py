@@ -77,13 +77,13 @@ class GraphDecoder(tf.keras.layers.Layer):
   def _process_tgt_token_ids(self, tgt_token_ids):
     """Prepare decode_step input.
 
-        Args:
-          tgt_token_ids: <int64>[batch_sz, tgt_seq_len].
-        Returns:
-          A pair of:
-            is_target_type: <bool>[batch_sz, tgt_seq_len]
-            dec_input_src_selection: <int64>[batch_sz, tgt_seq_len, src_seq_len].
-        """
+    Args:
+      tgt_token_ids: <int64>[batch_sz, tgt_seq_len].
+    Returns:
+      A pair of:
+        is_target_type: <bool>[batch_sz, tgt_seq_len]
+        dec_input_src_selection: <int64>[batch_sz, tgt_seq_len, src_seq_len].
+    """
 
     is_target_type = tgt_token_ids < self.tgt_vocab_size
 
@@ -258,6 +258,7 @@ class GraphTransformer(tf.keras.Model):
       "num_src_tokens": None,
       "num_tgt_tokens": None,
       "dropout": 0.2,
+      "biaffine": True
   }
 
   def __init__(self, src_vocab, tgt_vocab, hparams=None):
@@ -273,6 +274,7 @@ class GraphTransformer(tf.keras.Model):
     self.tgt_vocab_size = len(tgt_vocab)
     self.src_seq_len = self.hparams["num_src_tokens"]
     self.tgt_seq_len = self.hparams["num_tgt_tokens"]
+    self.biaffine = self.hparams["biaffine"]
 
     self.encoder = Encoder(num_layers=self.hparams["num_layers"],
                            d_model=self.hparams["d_model"],
@@ -289,7 +291,8 @@ class GraphTransformer(tf.keras.Model):
                                 tgt_vocab=self.tgt_vocab,
                                 src_seq_len=self.src_seq_len,
                                 maximum_position_encoding=self.tgt_seq_len,
-                                rate=self.hparams["dropout"])
+                                rate=self.hparams["dropout"],
+                                biaffine=self.biaffine)
 
   def call(self, examples, is_train=True):
     if is_train:
