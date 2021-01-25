@@ -25,6 +25,7 @@ trainer --save_model_path ~/workspace/seq2graph/seq2seq_savedmodel \
 
 from absl import app
 from absl import flags
+from absl import logging
 
 import os
 import json
@@ -154,8 +155,8 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
       total_train_loss += batch_loss
 
       if batch % 100 == 0:
-        print("Epoch {} Batch {} Loss {:.4f}".format(epoch + 1, batch,
-                                                     batch_loss.numpy()))
+        logging.info("Epoch {} Batch {} Loss {:.4f}".format(
+            epoch + 1, batch, batch_loss.numpy()))
 
     num_train_batch = batch + 1
 
@@ -204,7 +205,7 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
         "best {:.4f}@{}".format(best_token_accuracy_dev,
                                 best_token_accuracy_dev_epoch)
     ])
-    print(message)
+    logging.info(message)
     if save_model_path:
       with open(os.path.join(save_model_path, "log"), "a") as log_f:
         print(message, file=log_f)
@@ -218,9 +219,9 @@ def train(model_type, epochs, train_set, dev_set, src_vocab, tgt_vocab, hparams,
                            save_format="tf")
         with open(os.path.join(save_model_path, "stats"), "w") as stats_f:
           print(message, file=stats_f)
-        print("Model saved to {}.".format(save_model_path))
+        logging.info("Model saved to {}.".format(save_model_path))
 
-    print("  Time taken for 1 epoch train {}s dev {}s\n".format(
+    logging.info("  Time taken for 1 epoch train {}s dev {}s\n".format(
         dev_start - train_start, epoch_finish - dev_start))
 
 
@@ -293,9 +294,9 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
 
   token_accuracy_val = token_accuracy.result().numpy()
   exact_accuracy_val = exact_accuracy.result().numpy()
-  print("Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
+  logging.info("Loss {:.4f} TokenAcc {:.4f} ExactMatch {:.4f}".format(
       total_loss / num_batch, token_accuracy_val, exact_accuracy_val))
-  print("  Time taken: {}s\n".format(time.time() - dev_start))
+  logging.info("  Time taken: {}s\n".format(time.time() - dev_start))
 
   # Flatten the results over batches
   result_dicts = []
@@ -326,9 +327,9 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
           for pred in predicted_tgt_beam
       ]):
         exact_match_at_k_count += 1
-  print("Offline exact match {:.4f}".format(
+  logging.info("Offline exact match {:.4f}".format(
       float(exact_match_count) / len(result_dicts)))
-  print("Offline exact match @ K={} {:.4f}".format(
+  logging.info("Offline exact match @ K={} {:.4f}".format(
       FLAGS.beam_size,
       float(exact_match_at_k_count) / len(result_dicts)))
 

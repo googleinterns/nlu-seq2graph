@@ -1,7 +1,5 @@
-"""
-Copyright 2020 Google LLC
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
+"""Copyright 2020 Google LLC Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
+
 You may obtain a copy of the License at
     https://www.apache.org/licenses/LICENSE-2.0
 Unless required by applicable law or agreed to in writing, software
@@ -25,6 +23,7 @@ trainer --save_model_path ~/workspace/seq2graph/seq2seq_savedmodel \
 
 from absl import app
 from absl import flags
+from absl import logging
 
 import os
 import json
@@ -33,17 +32,19 @@ import shutil
 import time
 
 import tensorflow as tf
-import tensorflow_addons as tfa
 import numpy as np
 
 from vocabulary import Vocabulary
 from dataset import build_dataset
 from graph_transformer import GraphTransformer
-from graph_utils import contain_tree
+from graph_utils import contains_tree
 from graph_utils import reconstruct_tree
+from graph_utils import precompute_children_combinations
+from graph_utils import retrieve_trees
 from training_utils import NoamSchedule
 from training_utils import EdgeLoss
 from training_utils import SequenceLoss
+from fscore import FScore
 
 flags.DEFINE_string("data_spec", None, "Path to training data spec.")
 flags.DEFINE_integer("batch_size", 32, "Batch size.")
@@ -57,8 +58,7 @@ flags.DEFINE_string(
     "Init model from save_model_path and run prediction on the data set,")
 flags.DEFINE_string("predict_output", None, "Prediction output.")
 flags.DEFINE_bool("eager_run", False, "Run in eager mode for debugging.")
-flags.DEFINE_bool("test_seq2graph", False,
-                  "Use seq2graph metric in evaluating dev set.")
+flags.DEFINE_string("ref_derivs", None, "Reference dev derivations.")
 
 FLAGS = flags.FLAGS
 
@@ -82,8 +82,8 @@ def process_one_batch(model,
     loss = sequence_loss_fn(prediction_logits, tgt_token_ids)
     m = tf.math.not_equal(tgt_token_ids, tgt_vocab.token2idx[tgt_vocab.PAD])
     loss += edge_loss_fn(edge_logits[:, :-1, :],
-                              tgt_edges[:, 1:, :],
-                              edge_mask=m)
+                         tgt_edges[:, 1:, :],
+                         edge_mask=m)
     prediction_edge = tf.cast(edge_logits > 0, dtype=tf.int64)
 
     predictions = tf.argmax(prediction_logits, axis=-1)
@@ -92,9 +92,9 @@ def process_one_batch(model,
       gradients = tape.gradient(loss, model.trainable_variables)
       optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
-    # Shape: [batch_sz, max_num_tgt_tokens]
-    if not FLAGS.test_seq2graph or (FLAGS.test_seq2graph and is_train):
+    if is_train:
 
+      # Shape: [batch_sz, max_num_tgt_tokens]
       oov_mask = tf.not_equal(tgt_token_ids, tgt_vocab.token2idx[tgt_vocab.PAD])
 
       token_accuracy.update_state(tgt_token_ids,
@@ -140,6 +140,18 @@ def process_one_batch(model,
       return loss, predictions, prediction_edge, None, None, None
 
 
+def get_ref_tree_strings(flatten_tgt_trees, tgt_vocab):
+  ref_trees = [[]]
+  for v in flatten_tgt_trees:
+    if v == tgt_vocab.token2idx[tgt_vocab.PAD]:
+      ref_trees.append([])
+    else:
+      ref_trees[-1].append(
+          tgt_vocab.idx2token[v] if v < len(tgt_vocab) else str(v -
+                                                                len(tgt_vocab)))
+  return [" ".join(t) for t in ref_trees if t]
+
+
 def train(model_type,
           epochs,
           train_set,
@@ -166,23 +178,21 @@ def train(model_type,
 
   best_token_accuracy_train = 0
   best_token_accuracy_train_epoch = 0
-  if not FLAGS.test_seq2graph:
-    best_token_accuracy_dev = 0
-    best_token_accuracy_dev_epoch = 0
-  else:
-    best_tree_in = 0
-    best_tree_in_epoch = 0
+  best_tree_in_epoch = 0
+  best_tree_in = 0
+  best_deriv_fscore_epoch = 0
+  best_deriv_fscore = FScore()
 
   for epoch in range(epochs):
-    error_log.append('epoch ' + str(epoch) + '\n')
+    error_log.append("epoch " + str(epoch) + "\n")
     train_start = time.time()
     total_train_loss = 0
     token_accuracy_train = tf.keras.metrics.Accuracy()
     exact_accuracy_train = tf.keras.metrics.Accuracy()
     edge_accuracy_train = tf.keras.metrics.Accuracy()
-    train_p = 0
-    train_r = 0
-    train_f1 = 0
+    train_edge_p = 0
+    train_edge_r = 0
+    train_edge_f1 = 0
     for batch, examples in enumerate(train_set):
       batch_loss, _, _, p, r, f1 = process_one_batch(
           model,
@@ -195,186 +205,72 @@ def train(model_type,
           exact_accuracy_train,
           edge_accuracy=edge_accuracy_train)
       total_train_loss += batch_loss
-      train_p += p
-      train_r += r
-      train_f1 += f1
+      train_edge_p += p
+      train_edge_r += r
+      train_edge_f1 += f1
       if batch % 100 == 0:
-        print("Epoch {} Batch {} Loss {:.4f}".format(epoch + 1, batch,
-                                                     batch_loss.numpy()))
+        logging.info("Epoch {} Batch {} Loss {:.4f}".format(
+            epoch + 1, batch, batch_loss.numpy()))
 
     num_train_batch = batch + 1
-    train_p /= num_train_batch
-    train_r /= num_train_batch
-    train_f1 /= num_train_batch
-
-    dev_start = time.time()
-    total_dev_loss = 0
-    token_accuracy_dev = tf.keras.metrics.Accuracy()
-    exact_accuracy_dev = tf.keras.metrics.Accuracy()
-    edge_accuracy_dev = tf.keras.metrics.Accuracy()
-    if not FLAGS.test_seq2graph:
-      dev_p = 0
-      dev_r = 0
-      dev_f1 = 0
-    else:
-      tree_in = 0
-      all_tree = 0
-      cycle_num = 0
-    for batch, examples in enumerate(dev_set):
-      (batch_loss, dev_predictions, dev_prediction_edge, p, r,
-       f1) = process_one_batch(model,
-                               sequence_loss_fn,
-                               edge_loss_fn,
-                               examples,
-                               tgt_vocab,
-                               optimizer,
-                               token_accuracy_dev,
-                               exact_accuracy_dev,
-                               is_train=False,
-                               edge_accuracy=edge_accuracy_dev)
-      total_dev_loss += batch_loss
-      if not FLAGS.test_seq2graph:
-        dev_p += p
-        dev_r += r
-        dev_f1 += f1
-      else:
-        for e in range(len(examples["tgt_token_ids"])):
-
-          orig_tgt_token_ids = examples["tgt_token_ids"][e].numpy().tolist()
-          orig_tgt_edges = examples["tgt_edges"][e].numpy().tolist()
-          orig_length = sum(tok != tgt_vocab.token2idx[tgt_vocab.PAD]
-                            for tok in orig_tgt_token_ids)
-
-          dev_pred = dev_predictions[e].numpy().tolist()
-          dev_edge = dev_prediction_edge[e].numpy().tolist()
-          if tgt_vocab.token2idx[tgt_vocab.EOS] in dev_pred:
-            dev_length = dev_pred.index(tgt_vocab.token2idx[tgt_vocab.EOS])
-          else:
-            dev_length = len(dev_pred) - 1
-
-          orig_tree, _ = reconstruct_tree(orig_tgt_token_ids, orig_tgt_edges,
-                                          orig_length, tgt_vocab)
-          predict_tree, has_cycle = reconstruct_tree(dev_pred[1:],
-                                                     dev_edge[:-1],
-                                                     dev_length,
-                                                     tgt_vocab,
-                                                     with_bos=True)
-
-          all_tree += 1
-
-          if contain_tree(predict_tree[0], orig_tree[0]):
-            tree_in += 1
-          else:
-            src_token_ids = examples["src_token_ids"][e].numpy().tolist()
-            src_length = sum(tok != src_vocab.token2idx[src_vocab.PAD]
-                             for tok in src_token_ids)
-            src_tokens = [
-                src_vocab.idx2token[idx] for idx in src_token_ids[:src_length]
-            ]
-            error_log.append('src tokens: ' + ' '.join(src_tokens) + '\n')
-
-            tgt_tokens = [
-                tgt_vocab.idx2token[idx]
-                if idx < len(tgt_vocab) else str(idx - len(tgt_vocab))
-                for idx in orig_tgt_token_ids[:orig_length]
-            ]
-            error_log.append('tgt tokens: ' + ' '.join(tgt_tokens) + '\n')
-
-            error_log.append('orig edge:\n')
-
-            for ss in range(len(orig_tgt_edges[:orig_length])):
-              error_log.append(' '.join(
-                  [str(tt) for tt in orig_tgt_edges[ss][:orig_length]]) + '\n')
-            error_log.append('orig tree: ' +
-                             ' '.join([v.word for v in orig_tree]) + '\n')
-
-            pred_tokens = [
-                tgt_vocab.idx2token[idx]
-                if idx < len(tgt_vocab) else str(idx - len(tgt_vocab))
-                for idx in dev_pred[:dev_length + 1]
-            ]
-            error_log.append('pred tokens: ' + ' '.join(pred_tokens) + '\n')
-            error_log.append('pred edge:\n')
-
-            for ss in range(len(dev_edge[:dev_length])):
-              error_log.append(
-                  ' '.join([str(tt) for tt in dev_edge[ss][:dev_length + 1]]) +
-                  '\n')
-            error_log.append('pred tree: ' +
-                             ' '.join([v.word for v in predict_tree]) + '\n')
-          if has_cycle:
-            cycle_num += 1
-
-            pred_tokens = [
-                tgt_vocab.idx2token[idx]
-                if idx < len(tgt_vocab) else str(idx - len(tgt_vocab))
-                for idx in dev_pred[:dev_length + 1]
-            ]
-            print('pred tokens: ' + ' '.join(pred_tokens))
-            print('pred edge:')
-
-    if log_error:
-      with open(os.path.join(save_model_path, 'error_log'), "a") as log_error:
-        print(''.join(error_log), file=log_error)
-
-    if FLAGS.test_seq2graph:
-      dev_tree_in = tree_in / (all_tree * 1.0)
-    num_dev_batch = batch + 1
-    if not FLAGS.test_seq2graph:
-      dev_p /= num_dev_batch
-      dev_r /= num_dev_batch
-      dev_f1 /= num_dev_batch
-
-    epoch_finish = time.time()
+    train_edge_p /= num_train_batch
+    train_edge_r /= num_train_batch
+    train_edge_f1 /= num_train_batch
 
     token_accuracy_train_val = token_accuracy_train.result().numpy()
     exact_accuracy_train_val = exact_accuracy_train.result().numpy()
     edge_accuracy_train_val = edge_accuracy_train.result().numpy()
-    if not FLAGS.test_seq2graph:
-      token_accuracy_dev_val = token_accuracy_dev.result().numpy()
-      exact_accuracy_dev_val = exact_accuracy_dev.result().numpy()
-      edge_accuracy_dev_val = edge_accuracy_dev.result().numpy()
     if best_token_accuracy_train < token_accuracy_train_val:
       best_token_accuracy_train = token_accuracy_train_val
       best_token_accuracy_train_epoch = epoch + 1
+
+    dev_start = time.time()
+
+    dev_results = eval_on_dataset(model,
+                                  sequence_loss_fn,
+                                  edge_loss_fn,
+                                  json.load(open(FLAGS.ref_derivs)),
+                                  dev_set,
+                                  src_vocab,
+                                  tgt_vocab,
+                                  calc_deriv_metrics=True)
+
+    dev_tree_in = dev_results["naive_tree_in"]
+    deriv_fscore = dev_results["fscore"]
+    num_dev_batch = batch + 1
+
     write_model = False
 
-    if not FLAGS.test_seq2graph:
-      if best_token_accuracy_dev < token_accuracy_dev_val:
-        best_token_accuracy_dev = token_accuracy_dev_val
-        best_token_accuracy_dev_epoch = epoch + 1
-        write_model = True
-    else:
-      if dev_tree_in > best_tree_in:
-        best_tree_in = dev_tree_in
-        best_tree_in_epoch = epoch + 1
-        write_model = True
+    if deriv_fscore > best_deriv_fscore:
+      best_deriv_fscore = deriv_fscore
+      best_deriv_fscore_epoch = epoch + 1
+      write_model = True
+    elif dev_tree_in > best_tree_in:
+      best_tree_in = dev_tree_in
+      best_tree_in_epoch = epoch + 1
+      write_model = True
 
     message = []
-    message.append(
-        "Epoch {} Train Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} EdgePrecision {:.4f} EdgeRecall {:.4f} EdgeF1 {:.4f} ExactMatch {:.4f}"
-        .format(epoch + 1, total_train_loss / num_train_batch,
-                token_accuracy_train_val, edge_accuracy_train_val, train_p,
-                train_r, train_f1, exact_accuracy_train_val))
+    message.extend([
+        "Epoch {} Train Loss {:.4f} TokenAcc {:.4f}".format(
+            epoch + 1, total_train_loss / num_train_batch,
+            token_accuracy_train_val),
+        "EdgeAcc {:.4f} EdgePrecision {:.4f} EdgeRecall {:.4f} EdgeF1 {:.4f}".
+        format(edge_accuracy_train_val, train_edge_p, train_edge_r,
+               train_edge_f1),
+        " ExactMatch {:.4f}".format(exact_accuracy_train_val)
+    ])
     message.append("best {:.4f}@{}".format(best_token_accuracy_train,
                                            best_token_accuracy_train_epoch))
 
-    if not FLAGS.test_seq2graph:
-      message.append(
-          "Dev Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} EdgePrecision {:.4f} EdgeRecall {:.4f} EdgeF1 {:.4f} ExactMatch {:.4f}"
-          .format(total_dev_loss / num_dev_batch, token_accuracy_dev_val,
-                  edge_accuracy_dev_val, dev_p, dev_r, dev_f1,
-                  exact_accuracy_dev_val))
-      message.append("best {:.4f}@{}".format(best_token_accuracy_dev,
-                                             best_token_accuracy_dev_epoch))
-
-    else:
-      message.append("TreeIn {:.4f}".format(dev_tree_in))
-      message.append("best {:.4f}@{}".format(best_tree_in, best_tree_in_epoch))
-      message.append("cycle size: " + str(cycle_num))
+    message.append("DerivFScore {}".format(deriv_fscore))
+    message.append("best {}@{}".format(best_deriv_fscore,
+                                       best_deriv_fscore_epoch))
+    message.append("TreeIn {:.4f}".format(dev_tree_in))
+    message.append("best {:.4f}@{}".format(best_tree_in, best_tree_in_epoch))
     message = " ".join(message)
 
-    print(message)
+    logging.info(message)
     if save_model_path:
       with open(os.path.join(save_model_path, "log"), "a") as log_f:
         print(message, file=log_f)
@@ -388,31 +284,31 @@ def train(model_type,
                            save_format="tf")
         with open(os.path.join(save_model_path, "stats"), "w") as stats_f:
           print(message, file=stats_f)
-        print("Model saved to {}.".format(save_model_path))
+        logging.info("Model saved to {}.".format(save_model_path))
 
-    print("  Time taken for 1 epoch train {}s dev {}s\n".format(
-        dev_start - train_start, epoch_finish - dev_start))
+    logging.info("  Time taken for 1 epoch train {}s dev {}s\n".format(
+        dev_start - train_start, dev_results["time"]))
 
 
-def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
-            predict_output):
-  hparams = json.load(open(os.path.join(save_model_path, "hparams.json")))
-  hparams["predict_edge"] = False
-  model = model_type(src_vocab, tgt_vocab, hparams)
-  model.load_weights(os.path.join(save_model_path, "model_weights"))
-  sequence_loss_fn = SequenceLoss(tgt_vocab)
-  edge_loss_fn = EdgeLoss()
-
+def eval_on_dataset(model,
+                    sequence_loss_fn,
+                    edge_loss_fn,
+                    all_ref_derivs,
+                    dataset,
+                    src_vocab,
+                    tgt_vocab,
+                    calc_deriv_metrics=True):
   dev_start = time.time()
   total_loss = 0
   token_accuracy = tf.keras.metrics.Accuracy()
   exact_accuracy = tf.keras.metrics.Accuracy()
   edge_accuracy = tf.keras.metrics.Accuracy()
   results = []
-  for batch, examples in enumerate(eval_set):
+  for batch, examples in enumerate(dataset):
     (batch_loss, predictions, predictions_edge, _, _,
      _) = process_one_batch(model,
-                            sequence_loss_fn, edge_loss_fn,
+                            sequence_loss_fn,
+                            edge_loss_fn,
                             examples,
                             tgt_vocab,
                             None,
@@ -428,36 +324,135 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
   token_accuracy_val = token_accuracy.result().numpy()
   exact_accuracy_val = exact_accuracy.result().numpy()
   edge_accuracy_val = edge_accuracy.result().numpy()
-  print("Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} ExactMatch {:.4f}".format(
-      total_loss / num_batch, token_accuracy_val, edge_accuracy_val,
-      exact_accuracy_val))
 
-  print("  Time taken: {}s\n".format(time.time() - dev_start))
+  result_dicts = []
+  for examples, predictions, predictions_edge in results:
+    batch_sz = examples["src_token_ids"].shape[0]
+    batch_dicts = [dict() for _ in range(batch_sz)]
+    for key, tensor in examples.items():
+      for i in range(batch_sz):
+        batch_dicts[i][key] = tensor[i].tolist()
+    for i in range(batch_sz):
+      batch_dicts[i]["predicted_tgt_token_ids"] = predictions[i].tolist()
+      if tgt_vocab.token2idx[
+          tgt_vocab.EOS] in batch_dicts[i]["predicted_tgt_token_ids"]:
+        predicted_tgt_length = batch_dicts[i]["predicted_tgt_token_ids"].index(
+            tgt_vocab.token2idx[tgt_vocab.EOS]) + 1
+      else:
+        predicted_tgt_length = len(batch_dicts[i]["predicted_tgt_token_ids"])
+      batch_dicts[i]["predicted_tgt_edges"] = predictions_edge[i]
+    result_dicts.extend(batch_dicts)
+
+  if len(result_dicts) != len(all_ref_derivs):
+    logging.error("Mismatch results and ref derivs: {} vs. {}".format(
+        len(result_dicts), len(all_ref_derivs)))
+
+  contains_gold_tree_count = 0
+  naive_tree_in_count = 0
+  all_deriv_fscore = FScore()
+
+  for exid, (example, ref_derivs) in enumerate(zip(result_dicts,
+                                                   all_ref_derivs)):
+    src_token_ids = example["src_token_ids"]
+    src_tokens = [src_vocab.idx2token[idx] for idx in src_token_ids]
+    example["src_tokens"] = src_tokens
+
+    tgt_token_ids = example["tgt_token_ids"]
+    tgt_tokens = [
+        tgt_vocab.idx2token[idx]
+        if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
+        for idx in tgt_token_ids
+    ]
+    tgt_length = tgt_token_ids.index(tgt_vocab.token2idx[tgt_vocab.EOS]) + 1
+    tgt_edges = np.array(
+        example["tgt_edges"])[:tgt_length, :tgt_length].reshape(
+            (tgt_length, tgt_length))
+    tgt_tree = reconstruct_tree(tgt_token_ids[1:], tgt_edges[1:],
+                                tgt_length - 2, tgt_vocab)
+    if not tgt_tree:
+      logging.error("Invalid ref dag")
+      continue
+
+    predicted_tgt_token_ids = example["predicted_tgt_token_ids"]
+    predicted_tgt_tokens = [
+        tgt_vocab.idx2token[idx]
+        if idx < len(tgt_vocab) else src_tokens[idx - len(tgt_vocab)]
+        for idx in predicted_tgt_token_ids
+    ]
+    if tgt_vocab.token2idx[tgt_vocab.EOS] in predicted_tgt_token_ids:
+      predicted_tgt_length = predicted_tgt_token_ids.index(
+          tgt_vocab.token2idx[tgt_vocab.EOS])
+    else:
+      predicted_tgt_length = len(predicted_tgt_token_ids) - 1
+    predicted_tgt_edges = (example["predicted_tgt_edges"]
+                           [:predicted_tgt_length, :predicted_tgt_length])
+
+    assert predicted_tgt_token_ids[0] == tgt_vocab.token2idx[tgt_vocab.BOS]
+    predict_tree = reconstruct_tree(predicted_tgt_token_ids[1:],
+                                    predicted_tgt_edges,
+                                    predicted_tgt_length - 1,
+                                    tgt_vocab,
+                                    robust_mode=True)
+
+    if predict_tree:
+      if contains_tree(predict_tree[0], tgt_tree[0]):
+        naive_tree_in_count += 1
+
+      if not calc_deriv_metrics:
+        continue
+
+      children_comb = precompute_children_combinations(predict_tree[0])
+      predicted_trees = []
+      for t in retrieve_trees(predict_tree[0]):
+        predicted_trees.append([n for n in t if n != tgt_vocab.BOS])
+      predicted_tree_strings = [" ".join(tree) for tree in predicted_trees]
+      if ref_derivs[0] in predicted_tree_strings:
+        contains_gold_tree_count += 1
+      ref_tree_set = set(ref_derivs)
+      predicted_tree_set = set(predicted_tree_strings)
+      deriv_fscore = FScore(correct=len(predicted_tree_set & ref_tree_set),
+                            predcount=len(predicted_tree_set),
+                            goldcount=len(ref_tree_set))
+      all_deriv_fscore += deriv_fscore
+  return {
+      "predictions": result_dicts,
+      "naive_tree_in": float(naive_tree_in_count) / len(result_dicts),
+      "tree_in": float(contains_gold_tree_count) / len(result_dicts),
+      "fscore": all_deriv_fscore,
+      "time": time.time() - dev_start,
+      "token_accuracy": token_accuracy_val,
+      "exact_accuracy": exact_accuracy_val,
+      "edge_accuracy": edge_accuracy_val,
+      "loss": total_loss / num_batch
+  }
+
+
+def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
+            all_ref_derivs, predict_output):
+  hparams = json.load(open(os.path.join(save_model_path, "hparams.json")))
+  model = model_type(src_vocab, tgt_vocab, hparams)
+  model.load_weights(os.path.join(save_model_path, "model_weights"))
+  sequence_loss_fn = SequenceLoss(tgt_vocab)
+  edge_loss_fn = EdgeLoss()
+
+  results = eval_on_dataset(model, sequence_loss_fn, edge_loss_fn,
+                            all_ref_derivs, eval_set, src_vocab, tgt_vocab)
+
+  logging.info(
+      "Loss {:.4f} TokenAcc {:.4f} EdgeAcc {:.4f} ExactMatch {:.4f}".format(
+          results["loss"], results["token_accuracy"], results["edge_accuracy"],
+          results["exact_accuracy"]))
+  logging.info("NaiveTreeIn {:.4f} GoldTreeIn {:.4f} DerivFScore {}".format(
+      results["naive_tree_in"], results["tree_in"], results["fscore"]))
+
+  logging.info("  Time taken: {}s\n".format(results["time"]))
 
   if predict_output:
-    result_dicts = []
-    for examples, predictions, predictions_edge in results:
-      batch_sz = examples["src_token_ids"].shape[0]
-      batch_dicts = [dict() for _ in range(batch_sz)]
-      for key, tensor in examples.items():
-        for i in range(batch_sz):
-          batch_dicts[i][key] = tensor[i].tolist()
-      for i in range(batch_sz):
-        batch_dicts[i]["predicted_tgt_token_ids"] = predictions[i].tolist()
-        if tgt_vocab.token2idx[
-            tgt_vocab.EOS] in batch_dicts[i]["predicted_tgt_token_ids"]:
-          predicted_tgt_length = batch_dicts[i]["predicted_tgt_token_ids"].index(
-              tgt_vocab.token2idx[tgt_vocab.EOS]) + 1
-        else:
-          predicted_tgt_length = len(batch_dicts[i]["predicted_tgt_token_ids"])
-        batch_dicts[i]["predicted_tgt_edges"] = predictions_edge[i]
-      result_dicts.extend(batch_dicts)
-
     # Rebuild the tokens
     with open(os.path.join(predict_output), "w") as output_f:
-      for example in result_dicts:
+      for exid, example in enumerate(results["predictions"]):
         src_token_ids = example["src_token_ids"]
-        src_tokens = [src_vocab.idx2token[idx] for idx in src_token_ids]
+        src_tokens = example["src_tokens"]
         tgt_token_ids = example["tgt_token_ids"]
         tgt_tokens = [
             tgt_vocab.idx2token[idx]
@@ -482,16 +477,7 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
         predicted_tgt_edges = (example["predicted_tgt_edges"]
                                [:predicted_tgt_length, :predicted_tgt_length])
 
-        tgt_tree, _ = reconstruct_tree(tgt_token_ids, tgt_edges, tgt_length - 1,
-                                       tgt_vocab)
-        predict_tree, _ = reconstruct_tree(predicted_tgt_token_ids[1:],
-                                           predicted_tgt_edges[:-1],
-                                           predicted_tgt_length - 1,
-                                           tgt_vocab,
-                                           with_bos=True)
-
-        tree_in = contain_tree(predict_tree[0], tgt_tree[0])
-
+        print("example", exid, file=output_f)
         print("src_token_ids:\t",
               ", ".join(str(v) for v in src_token_ids),
               file=output_f)
@@ -510,8 +496,8 @@ def predict(model_type, eval_set, src_vocab, tgt_vocab, save_model_path,
         print(tgt_edges, file=output_f)
         print("predicted tgt edges", file=output_f)
         print(predicted_tgt_edges, file=output_f)
-        print("!!! tree in", tree_in, file=output_f)
         print("\n", file=output_f)
+    print("Deriv FScore", results["fscore"])
 
 
 def main(argv):
@@ -537,7 +523,7 @@ def main(argv):
                              multiple=True)
     eval_set = eval_set.batch(FLAGS.batch_size, drop_remainder=False)
     predict(model_type, eval_set, src_vocab, tgt_vocab, FLAGS.save_model_path,
-            FLAGS.predict_output)
+            json.load(open(FLAGS.ref_derivs)), FLAGS.predict_output)
   else:
     hparams = {
         "batch_sz": FLAGS.batch_size,
@@ -567,7 +553,7 @@ def main(argv):
                             is_train=False,
                             predict_edge=True,
                             multiple=True)
-    dev_set = dev_set.batch(FLAGS.batch_size, drop_remainder=True)
+    dev_set = dev_set.batch(FLAGS.batch_size, drop_remainder=False)
 
     train(model_type, FLAGS.epochs, train_set, dev_set, src_vocab, tgt_vocab,
           hparams, FLAGS.save_model_path)
